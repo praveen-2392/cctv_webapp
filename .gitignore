@@ -1,0 +1,5 @@
+*.pt
+*.h5
+uploads/
+snapshots/
+evidence_clips/
