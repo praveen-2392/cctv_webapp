@@ -18,7 +18,5 @@ pinned: false
 
 \# CCTV Violence Detection WebApp
 
-
-
 A real-time violence detection system using YOLOv8 and TensorFlow.
 
