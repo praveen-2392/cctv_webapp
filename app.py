@@ -1,6 +1,5 @@
 from flask import Flask, render_template, request, jsonify, Response, session, redirect, url_for
 import cv2
-import gdown
 import numpy as np
 import time
 import os
@@ -105,27 +104,6 @@ os.makedirs("static/snapshots",    exist_ok=True)
 os.makedirs("uploads",             exist_ok=True)
 
 # ================= LOAD MODELS =================
-
-# ================= DOWNLOAD MODELS =================
-def download_models():
-    # best.pt
-    if not os.path.exists("best.pt"):
-        print("Downloading best.pt...")
-        gdown.download(
-            "https://drive.google.com/file/d/1c9O6vrPprrTEg8dApVHo1N-KGOedmrB4/view?usp=sharing",
-            "best.pt",
-            quiet=False
-        )
-
-    # violence model
-    if not os.path.exists("violence_detection_model.h5"):
-        print("Downloading violence model...")
-        gdown.download(
-            "https://drive.google.com/file/d/1EdORn1SYihgKu9yLZ5CDwe9X4TE9qkOI/view?usp=drive_link",
-            "violence_detection_model.h5",
-            quiet=False
-        )
-
 def load_models():
     global person_model, weapon_model, violence_model, models_loaded
     try:
@@ -143,11 +121,7 @@ def load_models():
         print(f"Model load error: {e}")
         models_loaded = False
 
-def init_models():
-    download_models()
-    load_models()
-
-threading.Thread(target=init_models, daemon=True).start()
+threading.Thread(target=load_models, daemon=True).start()
 
 # ================= HELPERS =================
 WEAPON_COLORS = {"gun": (0,0,255), "knife": (0,60,255)}
@@ -607,5 +581,4 @@ def snapshot():
     return jsonify({"ok": False})
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(debug=False, host="0.0.0.0", port=5000, threaded=True)
