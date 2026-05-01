@@ -1,8 +1,12 @@
+import os
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ["CUDA_VISIBLE_DEVICES"]  = ""
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+
 from flask import Flask, render_template, request, jsonify, Response, session, redirect, url_for
 import cv2
 import numpy as np
 import time
-import os
 import threading
 import datetime
 import requests as req
@@ -14,7 +18,7 @@ from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
 app.secret_key    = "cctv_secret_2025"
-app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024   # 500 MB upload limit
+app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024
 
 # ================= LOGIN =================
 USERS = {
@@ -68,7 +72,7 @@ class FixedInputLayer(InputLayer):
 state = {
     "running":        False,
     "paused":         False,
-    "mode":           "live",      # "live" or "video"
+    "mode":           "live",
     "source":         0,
     "video_path":     None,
     "video_name":     "",
@@ -83,7 +87,6 @@ state = {
     "weapon_count":   0,
     "start_time":     None,
     "runtime":        "00:00:00",
-    # video progress
     "video_frame":    0,
     "video_total":    0,
     "video_time":     "00:00",
@@ -98,10 +101,10 @@ violence_model = None
 
 ALLOWED = {"mp4", "avi", "mov", "mkv", "wmv", "flv"}
 
-os.makedirs("snapshots",           exist_ok=True)
-os.makedirs("evidence_clips",      exist_ok=True)
-os.makedirs("static/snapshots",    exist_ok=True)
-os.makedirs("uploads",             exist_ok=True)
+os.makedirs("snapshots",        exist_ok=True)
+os.makedirs("evidence_clips",   exist_ok=True)
+os.makedirs("static/snapshots", exist_ok=True)
+os.makedirs("uploads",          exist_ok=True)
 
 # ================= LOAD MODELS =================
 def load_models():
@@ -109,7 +112,7 @@ def load_models():
     try:
         print("Loading models...")
         person_model   = YOLO("yolov8s.pt")
-        weapon_model   = YOLO("best.pt")
+        weapon_model   = YOLO("first.pt")
         violence_model = load_model(
             "violence_detection_model.h5",
             compile=False,
@@ -149,20 +152,27 @@ def add_alert(atype, detail):
             "type":   atype,
             "detail": detail
         })
-        state["alerts"]         = state["alerts"][:60]
-        state["total_alerts"]  += 1
+        state["alerts"]        = state["alerts"][:60]
+        state["total_alerts"] += 1
         if atype in ("VIOLENCE", "HIGH ALERT"):
             state["violence_count"] += 1
         elif atype == "WEAPON":
             state["weapon_count"]   += 1
 
+# =======================================================
+# FIX 1 — Size filter
+# Real weapons are small objects in the frame.
+# If a detected box covers more than 18% of the frame
+# it is almost certainly a body part, not a weapon.
+# =======================================================
+def is_real_weapon_size(x1, y1, x2, y2, frame_w=640, frame_h=480):
+    box_area   = (x2 - x1) * (y2 - y1)
+    frame_area = frame_w * frame_h
+    ratio      = box_area / frame_area
+    return ratio < 0.18   # True = small enough to be a real weapon
+
 # ================= DETECTION CORE =================
 def run_detection(cap, is_video=False):
-    """
-    Shared detection loop used by both live camera and video file modes.
-    cap      — OpenCV VideoCapture already opened
-    is_video — True when running on uploaded video file
-    """
     frame_buffer   = []
     pred_buffer    = deque(maxlen=6)
     violence_votes = 0
@@ -192,7 +202,6 @@ def run_detection(cap, is_video=False):
 
         if not ret:
             if is_video:
-                # Video ended
                 break
             else:
                 fail_count += 1
@@ -208,7 +217,6 @@ def run_detection(cap, is_video=False):
         now_real     = time.time()
         th           = state["violence_th"]
 
-        # Update video progress
         if is_video and total_fr > 0:
             with state["lock"]:
                 state["video_frame"]    = frame_count
@@ -220,19 +228,37 @@ def run_detection(cap, is_video=False):
         frame   = enhance(frame)
         display = frame.copy()
 
-        # YOLO every 3rd frame
+        # ===== YOLO every 3rd frame =====
         if frame_count % 3 == 0 and models_loaded:
             p_res        = person_model(frame, conf=0.20, verbose=False)[0]
             person_boxes = [tuple(map(int, b.xyxy[0]))
                             for b in p_res.boxes if int(b.cls[0]) == 0]
-            w_res        = weapon_model(frame, conf=0.25, verbose=False)[0]
+
+            # FIX 2 — Raised confidence to 0.55 and added IOU filter
+            # This reduces false positives from fists/arms being detected as weapons
+            w_res = weapon_model(
+                frame,
+                conf    = 0.55,   # was 0.25 — now requires high confidence
+                iou     = 0.45,   # suppress overlapping duplicate boxes
+                verbose = False
+            )[0]
+
             weps = []
             for b in w_res.boxes:
                 cid          = int(b.cls[0])
                 cf           = float(b.conf[0])
                 x1,y1,x2,y2 = map(int, b.xyxy[0])
                 nm           = w_res.names[cid].lower()
+
+                # FIX 3 — Skip detection if box is too large to be a real weapon
+                # Fists and arms produce large boxes — real weapons are small
+                if not is_real_weapon_size(x1, y1, x2, y2):
+                    print(f"  [FILTER] Skipped large false positive: {nm} {cf:.2f} "
+                          f"box=({x1},{y1},{x2},{y2})")
+                    continue
+
                 weps.append((nm, cf, x1, y1, x2, y2))
+
             cached_persons = person_boxes
             cached_weapons = weps
         else:
@@ -271,8 +297,8 @@ def run_detection(cap, is_video=False):
         gray   = cv2.GaussianBlur(
             cv2.cvtColor(frame,cv2.COLOR_BGR2GRAY),(21,21),0)
         if prev_gray is not None:
-            diff   = cv2.absdiff(prev_gray, gray)
-            thr    = cv2.threshold(diff,10,255,cv2.THRESH_BINARY)[1]
+            diff = cv2.absdiff(prev_gray, gray)
+            thr  = cv2.threshold(diff,10,255,cv2.THRESH_BINARY)[1]
             for (x1,y1,x2,y2) in person_boxes:
                 roi = thr[y1:y2, x1:x2]
                 if roi.size > 0 and np.sum(roi)/255/roi.size > 0.02:
@@ -346,7 +372,7 @@ def run_detection(cap, is_video=False):
                 video_writer = None
                 send_video_file(vid_path)
 
-        # Overlay on frame
+        # Overlay
         cv2.rectangle(display,(0,0),(640,55),(0,0,0),-1)
         lbl = v_label
         col = v_color
@@ -363,7 +389,6 @@ def run_detection(cap, is_video=False):
                     f"score:{score:.2f}  th:{th:.2f}  persons:{len(person_boxes)}",
                     (215,50),cv2.FONT_HERSHEY_SIMPLEX,0.36,(160,160,160),1)
 
-        # Video mode — show progress on frame
         if is_video and total_fr > 0:
             prog = int((frame_count / total_fr) * 620)
             cv2.rectangle(display,(0,470),(640,480),(20,20,20),-1)
@@ -380,7 +405,6 @@ def run_detection(cap, is_video=False):
         if recording:
             cv2.circle(display,(615,20),8,(0,0,255),-1)
 
-        # Update state
         with state["lock"]:
             state["frame"]   = display.copy()
             state["status"]  = lbl
@@ -390,7 +414,6 @@ def run_detection(cap, is_video=False):
                 s = int(now_real - state["start_time"])
                 state["runtime"] = f"{s//3600:02d}:{(s%3600)//60:02d}:{s%60:02d}"
 
-        # Maintain correct playback speed for video
         if is_video:
             time.sleep(max(0, frame_delay - 0.01))
 
@@ -469,7 +492,6 @@ def video_feed():
     return Response(gen_frames(),
                     mimetype="multipart/x-mixed-replace; boundary=frame")
 
-# ---- Live camera ----
 @app.route("/api/start_live", methods=["POST"])
 def start_live():
     if "user" not in session: return jsonify({"ok": False})
@@ -488,7 +510,6 @@ def start_live():
     send_message(f"CCTV Live Started\nTime: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     return jsonify({"ok": True})
 
-# ---- Video upload ----
 @app.route("/api/upload_video", methods=["POST"])
 def upload_video():
     if "user" not in session: return jsonify({"ok": False, "msg": "Not logged in"})
@@ -501,7 +522,7 @@ def upload_video():
     ext = f.filename.rsplit(".",1)[-1].lower()
     if ext not in ALLOWED:
         return jsonify({"ok": False, "msg": f"File type .{ext} not allowed"})
-    filename = secure_filename(f.filename)
+    filename  = secure_filename(f.filename)
     save_path = os.path.join("uploads", filename)
     f.save(save_path)
     state.update({
@@ -518,7 +539,6 @@ def upload_video():
     send_message(f"Video Analysis Started\nFile: {filename}\nTime: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     return jsonify({"ok": True, "filename": filename})
 
-# ---- Stop ----
 @app.route("/api/stop", methods=["POST"])
 def stop():
     if "user" not in session: return jsonify({"ok": False})
@@ -529,21 +549,18 @@ def stop():
     )
     return jsonify({"ok": True})
 
-# ---- Pause ----
 @app.route("/api/pause", methods=["POST"])
 def pause():
     if "user" not in session: return jsonify({"ok": False})
     state["paused"] = not state["paused"]
     return jsonify({"paused": state["paused"]})
 
-# ---- Threshold ----
 @app.route("/api/set_threshold", methods=["POST"])
 def set_threshold():
     if "user" not in session: return jsonify({"ok": False})
     state["violence_th"] = float(request.json.get("value", 0.35))
     return jsonify({"ok": True})
 
-# ---- Status ----
 @app.route("/api/status")
 def get_status():
     if "user" not in session: return jsonify({})
@@ -568,7 +585,6 @@ def get_status():
             "models_loaded":  models_loaded
         })
 
-# ---- Manual snapshot ----
 @app.route("/api/snapshot", methods=["POST"])
 def snapshot():
     if "user" not in session: return jsonify({"ok": False})
